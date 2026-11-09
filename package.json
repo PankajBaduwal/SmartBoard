@@ -1,0 +1,13 @@
+{
+  "name": "nepal-smartboard",
+  "version": "1.0.0",
+  "description": "Nepal Digital Education — interactive Smart Board that runs on your own computer",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/PankajBaduwal/SmartBoard.git" },
+  "scripts": {
+    "start": "node launcher.js",
+    "serve": "node launcher.js --no-open"
+  },
+  "engines": { "node": ">=16" }
+}

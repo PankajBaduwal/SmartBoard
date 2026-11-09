@@ -1,0 +1,2053 @@
+'use strict';
+// ═══════════════════════════════════════════════
+// APP — main controller
+// ═══════════════════════════════════════════════
+const App = (() => {
+
+  // ── state ──
+  let currentTool   = 'select';
+  let currentColor  = '#0f172a';
+  let penSize       = 2;
+  let eraserSize    = 26;
+  let activeChapter = 1;
+  let activeSubject = 'mathematics';  // 'mathematics' | 'science' | ...
+  let recording     = false;
+  let sidebarHidden = false;
+  let rpanelHidden  = false;
+
+
+  // ── File tracking: remember where we saved so we can re-save without dialog ──
+  let lastSavePath   = null;  // full path of last saved .mbp file
+  let lastSaveFolder = null;  // folder of last saved/loaded file
+  let lastSaveName   = null;  // display name (without extension)
+
+  // ── multi-page state ──
+  // Each page stores shapes + in-memory ImageData (drawData) + serializable base64 (drawDataUrl)
+  let pages       = [{ id: 1, label: 'Page 1', shapes: [], strokes: [], drawData: null, drawDataUrl: null, bgImage: null, history: [], redoStack: [] }];
+  let currentPage = 0; // index into pages[]
+
+  // ─────────────────────────────────────────────
+  // INIT
+  // ─────────────────────────────────────────────
+  function init() {
+    // ── Init CurriculumStore if available ──
+    if (typeof CurriculumStore !== 'undefined') {
+      const subj = CurriculumStore.getActiveSubject();
+      if (subj) activeSubject = subj.id;
+    }
+
+    // Attach unload & visibility listeners immediately
+    window.addEventListener('pagehide', () => { flushSession(); });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushSession();
+    });
+
+    UI.buildSidebar();
+    UI.buildShapeGrid();
+    UI.buildColorPalette();
+    UI.buildPenSizes();
+    UI.buildBoardSwatches();
+    Canvas.init();
+    Drawing.attachEvents();
+    Drawing.syncPointerEvents();
+    renderPageTabs();
+
+    // Tool buttons
+    document.querySelectorAll('.tool-btn[data-tool]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.id === 'btn-fp-pen' || btn.id === 'btn-fp-eraser') return;
+        setTool(btn.dataset.tool);
+      });
+    });
+
+    $('btn-undo').addEventListener('click', () => undo());
+    $('btn-redo').addEventListener('click', () => redo());
+
+    // Wire tools if available
+    if (typeof PptPresenter !== 'undefined') PptPresenter.init();
+    if (typeof ImageTool !== 'undefined') ImageTool.init();
+    if (typeof WorkspaceSplit !== 'undefined') WorkspaceSplit.init();
+
+    // Keyboard & Fullscreen sync
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement) {
+        document.body.classList.remove('board-fullscreen');
+      } else {
+        document.body.classList.add('board-fullscreen');
+      }
+      setTimeout(() => {
+        if (typeof Canvas !== 'undefined' && Canvas.resize) Canvas.resize();
+        updatePageControls();
+      }, 80);
+    });
+
+    initBrightness();
+    document.addEventListener('click', (e) => {
+      const bCtrl = document.getElementById('board-brightness-control');
+      if (bCtrl && !bCtrl.contains(e.target)) {
+        const dd = document.getElementById('brightness-dropdown');
+        if (dd) dd.classList.add('hidden');
+      }
+    });
+
+    // Synchronously restore previous board session on frame 0
+    restoreActiveSession();
+
+    UI.updateStatus();
+    updateChapterLabel();
+
+    // Update topbar subject badge
+    const badge = document.getElementById('active-subject-badge');
+    if (badge) badge.textContent = activeSubject === 'science' ? '🔬 Science' : '📐 Mathematics';
+  }
+
+
+  
+  // ─────────────────────────────────────────────
+  // BOARD PERSISTENCE + 2-DAY HISTORY
+  //
+  //  • Every time the board is opened it starts as a NEW, empty board. Work is never silently re-opened.
+  //  • Everything you do is auto-saved (debounced, only the pages that changed) as an entry in "History".
+  //  • History keeps the last 2 days; older entries are deleted automatically. Any entry can be re-opened.
+  //  • Refreshing the page (F5) or pressing Back keeps the current board, so a refresh never loses work.
+  // ─────────────────────────────────────────────
+  const DB_NAME = 'EduVerseSmartBoardDB';
+  const DB_VERSION = 2;
+  const LEGACY_STORE = 'board_sessions';
+  const STORE_META = 'history_meta';   // id → { id, createdAt, savedAt, pageCount, subject, thumb }
+  const STORE_DATA = 'history_data';   // `${id}|m` settings · `${id}|p|${uid}` one page · `${id}|ppt` presenter state
+  const HISTORY_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+  const SAVE_DEBOUNCE_MS = 1500;       // save this long after the last change …
+  const SAVE_MAXWAIT_MS = 10000;       // … but never wait longer than this while drawing continuously
+  const THUMB_EVERY_MS = 45000;
+  const PPT_EVERY_MS = 20000;
+  const INTENT_KEY = 'sb_intent';      // sessionStorage: 'new' | 'resume:<id>' (set just before the board reloads itself)
+  const LIVE_KEY = 'sb_live_id';       // sessionStorage: id of the board open in this tab
+  const BACKUP_KEY = 'sb_unload_backup';
+
+  let dbPromise = null;
+  let sessionId = null;
+  let sessionCreatedAt = Date.now();
+  let everSaved = false;
+  let restoring = false;               // while a saved board is being loaded, nothing is written
+  let saveTimer = null;
+  let firstDirtyAt = 0;
+  let saveBusy = false;
+  let metaDirty = false;
+  const dirtyPages = new Set();        // page uids changed since they were last written
+  let knownUids = new Set();           // page uids currently stored for this entry
+  let lastThumbAt = 0;
+  let lastThumb = null;
+  let lastPptAt = 0;
+  let lastPrune = 0;
+
+  /** Board opened to show one catalogue simulation (?embed=…): a fresh board that is never saved over the user's own history. */
+  function isEmbedLaunch() {
+    try { return !!new URLSearchParams(window.location.search).get('embed'); } catch (e) { return false; }
+  }
+
+  function newId(prefix) { return (prefix || 'b') + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+  function ensureUid(pg) { if (!pg._uid) pg._uid = newId('p'); return pg._uid; }
+  function whenIdle(fn) {
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(fn, { timeout: 2500 });
+    else setTimeout(fn, 0);
+  }
+
+  // ── IndexedDB ──
+  function getDb() {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve) => {
+      if (typeof window === 'undefined' || !window.indexedDB) return resolve(null);
+      try {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          [LEGACY_STORE, STORE_META, STORE_DATA].forEach(n => { if (!db.objectStoreNames.contains(n)) db.createObjectStore(n); });
+        };
+        req.onsuccess = (e) => {
+          const db = e.target.result;
+          db.onversionchange = () => { try { db.close(); } catch (er) { /* ignore */ } dbPromise = null; };
+          resolve(db);
+        };
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch (e) { resolve(null); }
+    });
+    return dbPromise;
+  }
+
+  /** Runs `work(tx, stores)` in one transaction; resolves with the value work returns once the transaction completes (null on failure). */
+  function runTx(storeNames, mode, work) {
+    return getDb().then((db) => {
+      if (!db) return null;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(storeNames, mode);
+          let out;
+          tx.oncomplete = () => resolve(typeof out === 'function' ? out() : out);
+          tx.onerror = tx.onabort = () => resolve(null);
+          out = work(tx);
+        } catch (e) { resolve(null); }
+      });
+    });
+  }
+  const reqValue = (req) => () => req.result;
+
+  // ── what counts as "something on the board" ──
+  function isBlankPage(pg) {
+    return !(pg.strokes && pg.strokes.length) && !(pg.shapes && pg.shapes.length) && !pg.bgImage && !pg.drawDataUrl &&
+      !(pg.splitState && pg.splitState.mode && pg.splitState.mode !== 'normal');
+  }
+  function boardIsBlank() { return pages.every(isBlankPage); }
+
+  function makeThumb() {
+    try {
+      const base = document.getElementById('grid-canvas');
+      if (!base || !base.width || !base.height) return lastThumb;
+      const tw = 240, th = Math.max(1, Math.round(tw * base.height / base.width));
+      const c = document.createElement('canvas');
+      c.width = tw; c.height = th;
+      const x = c.getContext('2d');
+      x.fillStyle = '#ffffff';
+      x.fillRect(0, 0, tw, th);
+      ['grid-canvas', 'shape-canvas', 'draw-canvas'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el && el.width && el.height) x.drawImage(el, 0, 0, tw, th);
+      });
+      return c.toDataURL('image/jpeg', 0.6);
+    } catch (e) { return lastThumb; }
+  }
+
+  /** Plain, structured-clone-safe page record. Shapes go through JSON (they may carry image elements / functions). */
+  function pageRecord(pg) {
+    return {
+      uid: ensureUid(pg),
+      id: pg.id,
+      label: pg.label,
+      shapes: pg.shapes && pg.shapes.length ? JSON.parse(JSON.stringify(pg.shapes)) : [],
+      strokes: pg.strokes || [],
+      drawDataUrl: pg.drawDataUrl || null,
+      bgImage: pg.bgImage || null,
+      boardColorId: pg.boardColorId || null,
+      splitState: pg.splitState ? JSON.parse(JSON.stringify(pg.splitState)) : null
+    };
+  }
+  function settingsRecord() {
+    return {
+      savedAt: Date.now(),
+      currentPage,
+      activeChapter,
+      activeSubject,
+      currentTool,
+      currentColor,
+      penSize,
+      eraserSize,
+      boardBrightness,
+      boardColorId: (typeof Canvas !== 'undefined' && Canvas.getBoardColorId) ? Canvas.getBoardColorId() : null,
+      pageUids: pages.map(ensureUid),
+      pageLabels: pages.map(p => ({ id: p.id, label: p.label }))
+    };
+  }
+
+  /** Writes one history entry (settings + the given page records + presenter state) atomically and removes pages that no longer exist. */
+  function writeEntry(id, createdAt, settings, records, ppt, thumb) {
+    const meta = {
+      id, createdAt, savedAt: settings.savedAt, pageCount: settings.pageUids.length,
+      subject: settings.activeSubject || '', chapter: settings.activeChapter || null, thumb: thumb || null
+    };
+    const keep = new Set(settings.pageUids);
+    const orphans = [...knownUids].filter(u => !keep.has(u));
+    const put = (tx, recs) => {
+      const data = tx.objectStore(STORE_DATA);
+      recs.forEach(r => data.put(r, id + '|p|' + r.uid));
+      data.put(settings, id + '|m');
+      if (ppt !== undefined) { if (ppt) data.put(ppt, id + '|ppt'); else data.delete(id + '|ppt'); }
+      orphans.forEach(u => data.delete(id + '|p|' + u));
+      tx.objectStore(STORE_META).put(meta, id);
+    };
+    return runTx([STORE_META, STORE_DATA], 'readwrite', (tx) => {
+      try { put(tx, records); }
+      catch (e) { // a record held something that cannot be cloned — fall back to plain JSON for those pages
+        put(tx, records.map(r => JSON.parse(JSON.stringify(r))));
+      }
+    }).then((ok) => {
+      if (ok !== null) {
+        everSaved = true;
+        knownUids = keep;
+        records.forEach(r => dirtyPages.delete(r.uid));
+      }
+      return ok;
+    });
+  }
+
+  /** Collects what has to be written right now. `all` = every page (used for the final flush when the board closes). */
+  function collectSave(all) {
+    if (isEmbedLaunch() || restoring || !sessionId) return null;
+    saveCurrent();
+    if (boardIsBlank() && !everSaved) return null;       // never record an untouched board
+    const cur = pages[currentPage];
+    if (cur) dirtyPages.add(ensureUid(cur));
+    const records = [];
+    pages.forEach((pg) => {
+      const uid = ensureUid(pg);
+      if (all || dirtyPages.has(uid) || !knownUids.has(uid)) records.push(pageRecord(pg));
+    });
+    const now = Date.now();
+    if (all || now - lastThumbAt > THUMB_EVERY_MS || !lastThumb) { lastThumb = makeThumb(); lastThumbAt = now; }
+    let ppt;                                               // undefined = leave as it is
+    if (typeof PptPresenter !== 'undefined' && PptPresenter.serializeState && (all || now - lastPptAt > PPT_EVERY_MS)) {
+      try { ppt = PptPresenter.serializeState() || null; lastPptAt = now; } catch (e) { ppt = undefined; }
+    }
+    return { settings: settingsRecord(), records, ppt, thumb: lastThumb };
+  }
+
+  function runSave() {
+    saveTimer = null;
+    if (saveBusy) { scheduleAutoSave(); return; }
+    firstDirtyAt = 0;
+    const job = collectSave(false);
+    metaDirty = false;
+    if (!job) return;
+    saveBusy = true;
+    writeEntry(sessionId, sessionCreatedAt, job.settings, job.records, job.ppt, job.thumb)
+      .finally(() => { saveBusy = false; });
+    if (Date.now() - lastPrune > 10 * 60 * 1000) pruneExpired();
+  }
+
+  /** Debounced: many strokes in a row cause ONE save shortly after you pause, and only the changed page is written. */
+  function scheduleAutoSave() {
+    if (isEmbedLaunch() || restoring) return;
+    const pg = pages[currentPage];
+    if (pg) dirtyPages.add(ensureUid(pg));
+    metaDirty = true;
+    const now = Date.now();
+    if (!firstDirtyAt) firstDirtyAt = now;
+    if (saveTimer) clearTimeout(saveTimer);
+    const wait = Math.max(0, Math.min(SAVE_DEBOUNCE_MS, firstDirtyAt + SAVE_MAXWAIT_MS - now));
+    saveTimer = setTimeout(() => whenIdle(runSave), wait);
+  }
+  // kept for the modules that call it after every stroke: now just the cheap debounced version
+  function saveActiveSession() { scheduleAutoSave(); }
+
+  /** Final save when the board is hidden / closed / reloaded. Starts the write immediately and also leaves a copy for a same-tab reload. */
+  function flushSession() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    firstDirtyAt = 0;
+    const job = collectSave(true);
+    if (!job) return;
+    writeEntry(sessionId, sessionCreatedAt, job.settings, job.records, job.ppt, job.thumb);
+    try { sessionStorage.setItem(LIVE_KEY, sessionId); } catch (e) { /* ignore */ }   // keeps "this tab's board" known for a refresh
+    try {
+      const data = sessionDataFromParts(job.settings, pages.map(pageRecord), job.ppt);
+      sessionStorage.setItem(BACKUP_KEY, JSON.stringify({ id: sessionId, savedAt: job.settings.savedAt, createdAt: sessionCreatedAt, data }));
+    } catch (e) { try { sessionStorage.removeItem(BACKUP_KEY); } catch (er) { /* ignore */ } }
+  }
+
+  function sessionDataFromParts(settings, pageRecs, ppt) {
+    return Object.assign({}, settings, { version: 3, pages: pageRecs, pptPresenterState: ppt || null });
+  }
+
+  // ── History: list / open / delete ──
+  function pruneExpired() {
+    lastPrune = Date.now();
+    const cutoff = Date.now() - HISTORY_TTL_MS;
+    return runTx([STORE_META], 'readonly', (tx) => { const r = tx.objectStore(STORE_META).getAll(); return reqValue(r); }).then((all) => {
+      const stale = (all || []).filter(m => m && m.savedAt < cutoff && m.id !== sessionId).map(m => m.id);
+      return Promise.all(stale.map(deleteEntry));
+    }).catch(() => null);
+  }
+
+  function deleteEntry(id) {
+    return runTx([STORE_META, STORE_DATA], 'readwrite', (tx) => {
+      tx.objectStore(STORE_META).delete(id);
+      tx.objectStore(STORE_DATA).delete(IDBKeyRange.bound(id + '|', id + '|￿'));
+    }).then((ok) => { if (id === sessionId) { everSaved = false; knownUids = new Set(); } return ok; });
+  }
+
+  /** History entries (newest first), expired ones removed. */
+  function listHistory() {
+    return pruneExpired().then(() => runTx([STORE_META], 'readonly', (tx) => { const r = tx.objectStore(STORE_META).getAll(); return reqValue(r); }))
+      .then((all) => (all || []).filter(Boolean).sort((a, b) => b.savedAt - a.savedAt)
+        .map(m => Object.assign({}, m, { current: m.id === sessionId, expiresAt: m.savedAt + HISTORY_TTL_MS })));
+  }
+
+  function clearHistory() {
+    return listHistory().then(list => Promise.all(list.filter(m => !m.current).map(m => deleteEntry(m.id))));
+  }
+
+  function loadEntry(id) {
+    return runTx([STORE_META, STORE_DATA], 'readonly', (tx) => {
+      const data = tx.objectStore(STORE_DATA);
+      const metaReq = tx.objectStore(STORE_META).get(id);
+      const setReq = data.get(id + '|m');
+      const pptReq = data.get(id + '|ppt');
+      const pageReqs = [];
+      setReq.onsuccess = () => {
+        const s = setReq.result;
+        if (s && Array.isArray(s.pageUids)) s.pageUids.forEach(u => pageReqs.push(data.get(id + '|p|' + u)));
+      };
+      return () => {
+        const s = setReq.result;
+        if (!s) return null;
+        return { meta: metaReq.result, data: sessionDataFromParts(s, pageReqs.map(r => r.result).filter(Boolean), pptReq.result || null) };
+      };
+    });
+  }
+
+  /** Re-open a history entry: the current board is saved first, then the page reloads straight into the chosen one. */
+  function openHistoryEntry(id) {
+    flushSession();
+    try { sessionStorage.setItem(INTENT_KEY, 'resume:' + id); } catch (e) { /* ignore */ }
+    setTimeout(() => window.location.reload(), 120);   // let the final write start
+  }
+  /** Start a clean board (the current one stays in history). */
+  function startNewBoard() {
+    flushSession();
+    try { sessionStorage.setItem(INTENT_KEY, 'new'); } catch (e) { /* ignore */ }
+    setTimeout(() => window.location.reload(), 120);
+  }
+
+  // ── First board of a visit, or back to a board after refresh ──
+  function navigationType() {
+    try { const n = performance.getEntriesByType('navigation')[0]; return n ? n.type : 'navigate'; } catch (e) { return 'navigate'; }
+  }
+
+  function applySessionData(data) {
+    if (!data || !Array.isArray(data.pages) || data.pages.length === 0) return false;
+
+    if (data.activeSubject) activeSubject = data.activeSubject;
+    if (data.activeChapter) activeChapter = data.activeChapter;
+    if (data.penSize) penSize = data.penSize;
+    if (data.eraserSize) eraserSize = data.eraserSize;
+    if (data.boardBrightness !== undefined) setBoardBrightness(data.boardBrightness, false);
+
+    pages = data.pages.map((pg, idx) => ({
+      id: pg.id || (idx + 1),
+      _uid: pg.uid || newId('p'),
+      label: pg.label || ('Page ' + (idx + 1)),
+      shapes: Array.isArray(pg.shapes) ? pg.shapes : [],
+      strokes: Array.isArray(pg.strokes) ? pg.strokes : [],
+      drawData: null,
+      drawDataUrl: pg.drawDataUrl || null,
+      bgImage: pg.bgImage || null,
+      boardColorId: pg.boardColorId || null,
+      splitState: pg.splitState || null,
+      history: Array.isArray(pg.history) ? pg.history : [],
+      redoStack: Array.isArray(pg.redoStack) ? pg.redoStack : []
+    }));
+
+    currentPage = Math.max(0, Math.min(data.currentPage || 0, pages.length - 1));
+
+    if (pages[currentPage].boardColorId && typeof Canvas !== 'undefined' && Canvas.setBoardColor) {
+      Canvas.setBoardColor(pages[currentPage].boardColorId);
+    }
+
+    loadCurrent();
+    renderPageTabs();
+    updatePageControls();
+
+    setTool(data.currentTool || 'pen');
+    if (data.currentColor) setColor(data.currentColor);
+
+    if (data.pptPresenterState && typeof PptPresenter !== 'undefined' && PptPresenter.restoreState) {
+      const hasSplit = pages[currentPage].splitState && pages[currentPage].splitState.mode !== 'normal';
+      if (!hasSplit) PptPresenter.restoreState(data.pptPresenterState);
+    }
+
+    UI.updateStatus();
+
+    // Ensure double-rendering pass once layout stabilizes
+    setTimeout(() => {
+      if (typeof Canvas !== 'undefined') {
+        if (Canvas.resize) Canvas.resize();
+        if (Canvas.renderStrokes) Canvas.renderStrokes();
+        if (Canvas.renderShapes) Canvas.renderShapes();
+      }
+    }, 40);
+
+    return true;
+  }
+
+  /** Decides which board this visit shows: a brand-new one (default), the one chosen from History, or the same one after a refresh. */
+  function restoreActiveSession() {
+    if (isEmbedLaunch()) return false;
+    let intent = null, liveId = null;
+    try {
+      intent = sessionStorage.getItem(INTENT_KEY);
+      sessionStorage.removeItem(INTENT_KEY);
+      liveId = sessionStorage.getItem(LIVE_KEY);
+    } catch (e) { /* ignore */ }
+
+    let resumeId = null;
+    if (intent && intent.indexOf('resume:') === 0) resumeId = intent.slice(7);
+    else if (!intent) {
+      const nav = navigationType();
+      if ((nav === 'reload' || nav === 'back_forward') && liveId) resumeId = liveId;
+    }
+
+    if (!resumeId) {
+      // NEW board
+      sessionId = newId('b');
+      sessionCreatedAt = Date.now();
+      try { sessionStorage.setItem(LIVE_KEY, sessionId); sessionStorage.removeItem(BACKUP_KEY); } catch (e) { /* ignore */ }
+      migrateLegacy();
+      pruneExpired();
+      return true;
+    }
+
+    // RESUME (from History, or this tab's board after a refresh)
+    sessionId = resumeId;
+    try { sessionStorage.setItem(LIVE_KEY, sessionId); } catch (e) { /* ignore */ }
+    restoring = true;
+    let backup = null;
+    try { backup = JSON.parse(sessionStorage.getItem(BACKUP_KEY) || 'null'); sessionStorage.removeItem(BACKUP_KEY); } catch (e) { /* ignore */ }
+    if (backup && backup.id !== resumeId) backup = null;
+
+    loadEntry(resumeId).then((entry) => {
+      let data = entry && entry.data, createdAt = entry && entry.meta && entry.meta.createdAt;
+      if (backup && backup.data && (!data || (backup.savedAt || 0) > (data.savedAt || 0))) { data = backup.data; createdAt = createdAt || backup.createdAt; }
+      if (data && Array.isArray(data.pages) && data.pages.length) {
+        sessionCreatedAt = createdAt || Date.now();
+        knownUids = new Set((data.pages || []).map(p => p.uid).filter(Boolean));
+        everSaved = !!entry;
+        applySessionData(data);
+        knownUids = new Set(pages.map(p => p._uid));
+        pages.forEach(p => dirtyPages.add(p._uid));
+        if (!entry) everSaved = false;
+      } else if (!entry) {
+        if (typeof showToast === 'function') showToast('That history entry is no longer available');
+      }
+    }).catch(() => {}).finally(() => {
+      restoring = false;
+      if (everSaved === false && !boardIsBlank()) scheduleAutoSave();
+      pruneExpired();
+    });
+    return true;
+  }
+
+  /** One-time: the old "continue where you left off" copy becomes a normal history entry, then all the old storage is freed. */
+  function migrateLegacy() {
+    let done = false;
+    try { done = localStorage.getItem('sb_legacy_migrated') === '1'; } catch (e) { /* ignore */ }
+    if (done) return;
+    const keys = ['current_active_session', 'mbp_active_session_backup', 'mbp_active_session_meta'];
+    let payload = null;
+    try {
+      const raw = localStorage.getItem('current_active_session') || localStorage.getItem('mbp_active_session_backup');
+      if (raw) payload = JSON.parse(raw);
+    } catch (e) { /* ignore */ }
+    const finish = (pl) => {
+      try {
+        if (pl && Array.isArray(pl.pages) && pl.pages.some(p => (p.strokes && p.strokes.length) || (p.shapes && p.shapes.length) || p.bgImage) &&
+            pl.savedAt && Date.now() - pl.savedAt < HISTORY_TTL_MS) {
+          const id = newId('b');
+          const recs = pl.pages.map((p, i) => ({
+            uid: newId('p'), id: p.id || (i + 1), label: p.label || ('Page ' + (i + 1)),
+            shapes: p.shapes || [], strokes: p.strokes || [], drawDataUrl: p.drawDataUrl || null, bgImage: p.bgImage || null,
+            boardColorId: p.boardColorId || null, splitState: p.splitState || null
+          }));
+          const settings = {
+            savedAt: pl.savedAt, currentPage: pl.currentPage || 0, activeChapter: pl.activeChapter, activeSubject: pl.activeSubject,
+            currentTool: pl.currentTool, currentColor: pl.currentColor, penSize: pl.penSize, eraserSize: pl.eraserSize,
+            boardBrightness: pl.boardBrightness, boardColorId: pl.boardColorId || null,
+            pageUids: recs.map(r => r.uid), pageLabels: recs.map(r => ({ id: r.id, label: r.label }))
+          };
+          const saved = knownUids; knownUids = new Set();
+          writeEntry(id, pl.savedAt, settings, recs, pl.pptPresenterState || null, null).finally(() => { knownUids = saved; });
+        }
+      } catch (e) { /* best effort */ }
+      try {
+        keys.forEach(k => localStorage.removeItem(k));
+        for (let i = localStorage.length - 1; i >= 0; i--) { const k = localStorage.key(i); if (k && k.indexOf('board_session_') === 0) localStorage.removeItem(k); }
+        localStorage.setItem('sb_legacy_migrated', '1');
+      } catch (e) { /* ignore */ }
+      runTx([LEGACY_STORE], 'readwrite', (tx) => { tx.objectStore(LEGACY_STORE).clear(); });
+    };
+    if (payload) { finish(payload); return; }
+    runTx([LEGACY_STORE], 'readonly', (tx) => { const r = tx.objectStore(LEGACY_STORE).get('current_active_session'); return reqValue(r); }).then(finish);
+  }
+
+  // kept for API compatibility
+  function clearActiveSessionStorage() { return sessionId ? deleteEntry(sessionId) : Promise.resolve(); }
+
+  function $(id) { return document.getElementById(id); }
+
+  // ─────────────────────────────────────────────
+  // SIDEBAR TOGGLE
+  // ─────────────────────────────────────────────
+  function toggleSidebar() {
+    sidebarHidden = !sidebarHidden;
+    const sb = $('sidebar');
+    if (sb) sb.classList.toggle('hide', sidebarHidden);
+    const sbt = $('sb-toggle');
+    if (sbt) {
+      sbt.textContent = sidebarHidden ? '▶' : '◀';
+      sbt.title = sidebarHidden ? 'Show chapters' : 'Hide chapters';
+    }
+    setTimeout(() => Canvas.resize(), 280);
+  }
+
+  function toggleRPanel() {
+    if (typeof UI !== 'undefined' && UI.toggleShapesFlyout) {
+      UI.toggleShapesFlyout();
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // MULTI-PAGE SYSTEM
+  // ─────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // PAGE MANAGEMENT & SYNCHRONIZATION
+  // ─────────────────────────────────────────────
+  function updatePageControls() {
+    const cur = currentPage + 1;
+    const total = pages.length;
+
+    // Fullscreen floating page navigator (right side)
+    const curNumEl = $('fs-nav-page-num');
+    const totalNumEl = $('fs-nav-page-total');
+    if (curNumEl) curNumEl.textContent = cur;
+    if (totalNumEl) totalNumEl.textContent = total;
+
+    const prevBtn = $('fs-nav-prev');
+    const nextBtn = $('fs-nav-next');
+    if (prevBtn) {
+      const isFirst = (currentPage <= 0);
+      prevBtn.disabled = isFirst;
+      prevBtn.classList.toggle('disabled', isFirst);
+    }
+    if (nextBtn) {
+      const isLast = (currentPage >= total - 1);
+      nextBtn.disabled = isLast;
+      nextBtn.classList.toggle('disabled', isLast);
+    }
+
+    // Compact Global Page Controls Capsule (‹ 1 / 4 › +)
+    const gpcCounter = $('gpc-counter');
+    if (gpcCounter) gpcCounter.textContent = `${cur} / ${total}`;
+    const gpcPrev = $('gpc-prev');
+    const gpcNext = $('gpc-next');
+    if (gpcPrev) {
+      gpcPrev.disabled = (currentPage <= 0);
+      gpcPrev.classList.toggle('disabled', currentPage <= 0);
+    }
+    if (gpcNext) {
+      gpcNext.disabled = (currentPage >= total - 1);
+      gpcNext.classList.toggle('disabled', currentPage >= total - 1);
+    }
+
+    // Sidebar & full-screen card counters
+    const fsp = $('fs-page-counter');
+    if (fsp) fsp.textContent = `${cur}/${total}`;
+    const sbp = $('sb-page');
+    if (sbp) sbp.textContent = cur;
+  }
+
+  function renderPageTabs() {
+    const bar = $('page-tabs-bar');
+    if (bar) {
+      bar.querySelectorAll('.page-tab').forEach(t => t.remove());
+      const addBtn = $('add-page-btn');
+      pages.forEach((pg, idx) => {
+        const tab = document.createElement('button');
+        tab.className = 'page-tab' + (idx === currentPage ? ' active' : '');
+        tab.innerHTML = `
+          <span onclick="App.switchPage(${idx})">${pg.label}</span>
+          ${pages.length > 1
+            ? `<span class="del-tab" onclick="App.deletePage(${idx})" title="Delete page">×</span>`
+            : ''}`;
+        tab.addEventListener('click', e => {
+          if (!e.target.classList.contains('del-tab')) App.switchPage(idx);
+        });
+        bar.insertBefore(tab, addBtn);
+      });
+    }
+
+    updatePageControls();
+  }
+
+  function addPage() {
+    // 1. Save current active page state completely (including any active split screen)
+    saveCurrent();
+
+    // 2. Inherit current board background theme so new page matches
+    const curColorId = (typeof Canvas !== 'undefined' && Canvas.getBoardColorId) ? Canvas.getBoardColorId() : null;
+
+    // 3. Push brand new blank page object (normal single whiteboard canvas)
+    pages.push({
+      id: Date.now(),
+      label: `Page ${pages.length + 1}`,
+      shapes: [],
+      strokes: [],
+      drawData: null,
+      drawDataUrl: null,
+      bgImage: null,
+      boardColorId: curColorId,
+      splitState: null,
+      history: [],
+      redoStack: []
+    });
+
+    // 4. Activate new page immediately
+    currentPage = pages.length - 1;
+    loadCurrent();
+    renderPageTabs();
+    showToast(`Page ${currentPage + 1} added`);
+    scheduleAutoSave();
+  }
+
+  function insertPageMiddle() {
+    saveCurrent();
+    const curColorId = (typeof Canvas !== 'undefined' && Canvas.getBoardColorId) ? Canvas.getBoardColorId() : null;
+    const newPage = {
+      id: Date.now(),
+      label: `Page ${currentPage + 2}`,
+      shapes: [],
+      strokes: [],
+      drawData: null,
+      drawDataUrl: null,
+      bgImage: null,
+      boardColorId: curColorId,
+      splitState: null,
+      history: [],
+      redoStack: []
+    };
+    pages.splice(currentPage + 1, 0, newPage);
+    pages.forEach((p, i) => { p.label = `Page ${i + 1}`; });
+    currentPage = currentPage + 1;
+    loadCurrent();
+    renderPageTabs();
+    showToast(`Page ${currentPage + 1} inserted in middle`);
+    scheduleAutoSave();
+  }
+
+  function deleteCurrentPage() {
+    if (pages.length <= 1) {
+      showToast('Cannot delete the only page');
+      return;
+    }
+    deletePage(currentPage);
+  }
+
+  function prevPage() {
+    if (currentPage > 0) {
+      switchPage(currentPage - 1);
+    }
+  }
+
+  function nextPage() {
+    if (currentPage < pages.length - 1) {
+      switchPage(currentPage + 1);
+    }
+  }
+
+  function switchPage(idx) {
+    if (idx === currentPage || idx < 0 || idx >= pages.length) return;
+    saveCurrent();
+    currentPage = idx;
+    loadCurrent();
+    renderPageTabs();
+    scheduleAutoSave();
+  }
+
+  function deletePage(idx) {
+    if (pages.length === 1) { showToast('Cannot delete the only page'); return; }
+    pages.splice(idx, 1);
+    if (currentPage >= pages.length) currentPage = pages.length - 1;
+    loadCurrent();
+    renderPageTabs();
+    scheduleAutoSave();
+  }
+
+  function saveCurrent() {
+    if (!pages[currentPage]) return;
+    pages[currentPage].shapes       = (typeof Canvas !== 'undefined' && Canvas.getShapes) ? Canvas.getShapes() : [];
+    pages[currentPage].strokes      = (typeof Canvas !== 'undefined' && Canvas.getStrokes) ? Canvas.getStrokes() : [];
+    pages[currentPage].bgImage      = (typeof Canvas !== 'undefined' && Canvas.getBgImage) ? Canvas.getBgImage() : null;
+    pages[currentPage].boardColorId = (typeof Canvas !== 'undefined' && Canvas.getBoardColorId) ? Canvas.getBoardColorId() : null;
+    pages[currentPage].history      = (typeof Canvas !== 'undefined' && Canvas.getHistory) ? Canvas.getHistory() : [];
+    pages[currentPage].redoStack    = (typeof Canvas !== 'undefined' && Canvas.getRedoStack) ? Canvas.getRedoStack() : [];
+
+    // Save split screen state for this specific page
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.serialize && WorkspaceSplit.getMode) {
+      const mode = WorkspaceSplit.getMode();
+      if (mode && mode !== 'normal') {
+        pages[currentPage].splitState = WorkspaceSplit.serialize();
+      } else {
+        pages[currentPage].splitState = null;
+      }
+    }
+  }
+
+  function loadCurrent() {
+    if (!pages[currentPage]) return;
+    if (typeof CompassTool !== 'undefined') CompassTool.onPageChange();
+    if (pages[currentPage].boardColorId && typeof Canvas !== 'undefined' && Canvas.setBoardColor) {
+      Canvas.setBoardColor(pages[currentPage].boardColorId);
+    }
+    const strokes = pages[currentPage].strokes || [];
+    const hist = pages[currentPage].history || [];
+    const redoStk = pages[currentPage].redoStack || [];
+    Canvas.loadPageState(
+      pages[currentPage].shapes,
+      pages[currentPage].drawDataUrl || null,
+      pages[currentPage].bgImage || null,
+      strokes,
+      hist,
+      redoStk
+    );
+
+    // Restore split screen mode for this page or ensure normal blank whiteboard
+    if (typeof WorkspaceSplit !== 'undefined') {
+      const savedSplit = pages[currentPage].splitState;
+      if (savedSplit && savedSplit.mode && savedSplit.mode !== 'normal') {
+        WorkspaceSplit.restore(savedSplit);
+      } else {
+        WorkspaceSplit.setMode('normal');
+      }
+    }
+
+    UI.updateStatus();
+    updatePageControls();
+  }
+
+  // ─────────────────────────────────────────────
+  // CLEAR CURRENT PAGE (With Confirmation & Undo)
+  // ─────────────────────────────────────────────
+  function confirmClearCurrentPage() {
+    const title = $('fs-modal-title');
+    if (title) title.textContent = `Page ${currentPage + 1} of ${pages.length}`;
+    const desc = $('fs-modal-desc');
+    if (desc) desc.textContent = 'Choose what to do with this page. Other pages are not changed.';
+    const del = $('fs-modal-delete');
+    const onlyPage = pages.length <= 1;
+    if (del) del.disabled = onlyPage;
+    const dh = $('fs-delete-hint');
+    if (dh) dh.textContent = onlyPage ? 'Not available — this is the only page.' : 'Remove this page completely. Later pages move up.';
+    const modal = $('fs-clear-modal');
+    if (modal) modal.classList.remove('hidden');
+  }
+
+  function closeClearModal() {
+    const modal = $('fs-clear-modal');
+    if (modal) modal.classList.add('hidden');
+  }
+
+  function executeClearCurrentPage() {
+    closeClearModal();
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+      const activeId = WorkspaceSplit.getActivePartitionId();
+      WorkspaceSplit.clearPartition(activeId);
+      showToastWithAction(`Partition ${activeId} cleared`, '↩ Undo Clear', () => {
+        WorkspaceSplit.undoActive();
+      });
+      return;
+    }
+    if (typeof Canvas !== 'undefined' && Canvas.clearAll) {
+      Canvas.clearAll();
+      saveCurrent();
+      if (window.PhysicsLab && typeof PhysicsLab.clearAnnotations === 'function') PhysicsLab.clearAnnotations();
+      if (window.MathVisualizer && typeof MathVisualizer.clearAnnotations === 'function') MathVisualizer.clearAnnotations();
+      if (window.GraphEngine && typeof GraphEngine.clearAnnotations === 'function') GraphEngine.clearAnnotations();
+      showToastWithAction(`Page ${currentPage + 1} cleared`, '↩ Undo Clear', () => {
+        undo();
+      });
+    }
+  }
+
+  function executeDeleteCurrentPage() {
+    closeClearModal();
+    if (pages.length <= 1) { showToast('Cannot delete the only page'); return; }
+    const n = currentPage + 1;
+    deletePage(currentPage);
+    showToast(`Page ${n} deleted`);
+  }
+
+  function clearBoard() {
+    confirmClearCurrentPage();
+  }
+
+  // ─────────────────────────────────────────────
+  // PDF READY MODAL & TRUSTED DOWNLOAD HANDLER
+  // ─────────────────────────────────────────────
+  let pendingPdfBlob = null;
+  let pendingPdfFilename = '';
+
+  function openPdfModal(pageCount, filename, sizeBytes) {
+    const modal = $('pdf-ready-modal');
+    if (!modal) return;
+    const desc = $('pdf-modal-desc');
+    const sizeKb = Math.round(sizeBytes / 1024);
+    if (desc) {
+      desc.innerHTML = `All <b>${pageCount}</b> board page${pageCount > 1 ? 's' : ''} compiled into <b>1 PDF document</b> (${sizeKb} KB).<br><span style="font-size:12px;opacity:0.85;color:#38bdf8;word-break:break-all;margin-top:6px;display:inline-block;">📄 ${filename}</span>`;
+    }
+    modal.classList.remove('hidden');
+  }
+
+  function closePdfModal() {
+    const modal = $('pdf-ready-modal');
+    if (modal) modal.classList.add('hidden');
+  }
+
+  async function downloadGeneratedPdf() {
+    if (!pendingPdfBlob) {
+      closePdfModal();
+      return;
+    }
+    const filename = pendingPdfFilename || 'PiyushDhara-Board-Notes.pdf';
+    const blob = pendingPdfBlob;
+
+    // 1. Preferred modern API on Windows: File System Access API
+    // Opens genuine Windows "Save As" dialog with .pdf extension pre-set
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{
+            description: 'PDF Document (*.pdf)',
+            accept: { 'application/pdf': ['.pdf'] }
+          }]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        closePdfModal();
+        showToast(`✓ Saved: ${handle.name || filename}`);
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          // User clicked Cancel in Windows file picker
+          return;
+        }
+        console.warn('showSaveFilePicker failed, falling back to direct anchor download:', err);
+      }
+    }
+
+    // 2. Direct anchor click in genuine user-click event (Edge preserves .pdf extension)
+    try {
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 15000);
+      closePdfModal();
+      showToast(`✓ Downloaded ${filename}`);
+    } catch (err) {
+      console.error('Download error:', err);
+      showToast('❌ Download failed: ' + err.message);
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // TOOL
+  // ─────────────────────────────────────────────
+  function setTool(tool) {
+    const changed = currentTool !== tool;
+    currentTool = tool;
+
+    // Digital Compass: show its instrument only while the compass tool is active
+    if (typeof CompassTool !== 'undefined') {
+      if (tool === 'compass') CompassTool.activate();
+      else CompassTool.deactivate();
+    }
+
+    // Route tool changes to active split screen partition if active
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+      WorkspaceSplit.setActivePartitionTool(tool);
+    }
+
+    // Sync with 2D Graphable Workspace modal if open
+    const graphModal = document.getElementById('graph-object-editor-modal');
+    if (graphModal && graphModal.classList.contains('open')) {
+      if (typeof GraphObject !== 'undefined' && GraphObject.setAnnoTool) {
+        if (tool === 'pen') GraphObject.setAnnoTool('pen');
+        else if (tool === 'highlighter') GraphObject.setAnnoTool('highlighter');
+        else if (tool === 'eraser') GraphObject.setAnnoTool('eraser');
+        else if (tool === 'select') GraphObject.setAnnoTool('inspect');
+      }
+    }
+
+    if (tool !== 'select' && typeof BoardClipboard !== 'undefined' && BoardClipboard.clearSelection) {
+      BoardClipboard.clearSelection();
+    }
+    document.querySelectorAll('.tool-btn[data-tool]').forEach(b => {
+      b.classList.toggle('active', b.dataset.tool === tool);
+    });
+    Drawing.syncPointerEvents();
+    if (typeof UI !== 'undefined') {
+      if (UI.closeAllFlyouts) UI.closeAllFlyouts();
+      if (UI.syncSubtoolButtons) UI.syncSubtoolButtons(tool);
+      if (tool === 'pen' || tool === 'highlighter') {
+        if (UI.closeEraserFlyout) UI.closeEraserFlyout();
+        if (typeof Canvas !== 'undefined' && Canvas.updateFloatingToolbar) Canvas.updateFloatingToolbar();
+      } else if (tool === 'eraser') {
+        if (UI.closePenFlyout) UI.closePenFlyout();
+        if (typeof Canvas !== 'undefined' && Canvas.updateFloatingToolbar) Canvas.updateFloatingToolbar();
+      } else if (tool === 'text') {
+        if (UI.closePenFlyout) UI.closePenFlyout();
+        if (UI.closeEraserFlyout) UI.closeEraserFlyout();
+        if (typeof Canvas !== 'undefined' && Canvas.showToolbarForTextTool) {
+          Canvas.showToolbarForTextTool();
+        }
+      } else {
+        if (UI.closePenFlyout) UI.closePenFlyout();
+        if (UI.closeEraserFlyout) UI.closeEraserFlyout();
+        if (typeof Canvas !== 'undefined' && Canvas.updateFloatingToolbar) {
+          Canvas.updateFloatingToolbar();
+        }
+      }
+      UI.syncPenPanel();
+      UI.updateStatus();
+    }
+
+    if (window.PhysicsLab && typeof PhysicsLab.syncToolWithBoard === 'function') {
+      PhysicsLab.syncToolWithBoard();
+    }
+    if (window.MathVisualizer && typeof MathVisualizer.syncToolWithBoard === 'function') {
+      MathVisualizer.syncToolWithBoard();
+    }
+    if (window.GraphEngine && typeof GraphEngine.syncToolWithBoard === 'function') {
+      GraphEngine.syncToolWithBoard();
+    }
+    if (changed) {
+      if (tool === 'smart-draw') {
+        showToast('✨ Smart Draw: Draw rough shapes or lines to convert cleanly');
+      } else if (tool === 'text') {
+        showToast('🔤 Text Tool: Click anywhere on the board to type');
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // COLOR
+  // ─────────────────────────────────────────────
+  function setColor(hex) {
+    currentColor = hex;
+
+    // Route color changes to active split screen partition if active
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+      WorkspaceSplit.setActivePartitionColor(hex);
+    }
+
+    // Sync with 2D Graphable Workspace modal if open
+    const graphModalCol = document.getElementById('graph-object-editor-modal');
+    if (graphModalCol && graphModalCol.classList.contains('open')) {
+      if (typeof GraphObject !== 'undefined' && GraphObject.setAnnoColor) {
+        GraphObject.setAnnoColor(hex);
+      }
+    }
+
+    document.querySelectorAll('.color-dot, .fp-color-dot').forEach(d => {
+      const match = (d.dataset.hex && d.dataset.hex.toLowerCase() === hex.toLowerCase()) ||
+                    (d.style.background && rgbToHex(d.style.background) === hex.toLowerCase());
+      d.classList.toggle('active', match);
+    });
+    if (typeof UI !== 'undefined' && UI.syncPenPanel) {
+      UI.syncPenPanel();
+    }
+  }
+
+  function rgbToHex(rgb) {
+    const m = rgb.match(/\d+/g);
+    if (!m || m.length < 3) return rgb;
+    return '#' + m.slice(0,3).map(v => parseInt(v).toString(16).padStart(2,'0')).join('');
+  }
+
+  // ─────────────────────────────────────────────
+  // CHAPTER
+  // ─────────────────────────────────────────────
+  function selectChapter(id) {
+    activeChapter = isNaN(+id) ? id : +id;
+    updateChapterLabel();
+    // Update CurriculumStore if available
+    if (typeof CurriculumStore !== 'undefined') {
+      CurriculumStore.setActiveChapter(activeChapter);
+    }
+    if (typeof UI !== 'undefined') {
+      if (UI.renderTopChapters) UI.renderTopChapters();
+      if (UI.updateSidebarCard) UI.updateSidebarCard();
+    }
+    const sel = document.getElementById('sb-chapter-select');
+    if (sel && sel.value !== String(activeChapter)) {
+      sel.value = activeChapter;
+    }
+    // Update right panel badge & button label above Color
+    const rpBadge = document.getElementById('rp-active-ch-badge');
+    if (rpBadge) rpBadge.textContent = `Unit ${activeChapter}`;
+    const rpBtnLbl = document.getElementById('rp-ch-tools-btn-label');
+    if (rpBtnLbl) rpBtnLbl.textContent = `Ch ${activeChapter} Tools`;
+
+    // USER REQUIREMENT: Automatically open chapter tools when clicking that unit
+    if (typeof UI !== 'undefined' && UI.openChapterPanel) {
+      UI.openChapterPanel();
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // SUBJECT SWITCHER
+  // ─────────────────────────────────────────────
+  function switchSubject(subjectId) {
+    if (subjectId === activeSubject) return;
+    activeSubject = subjectId;
+    // Let UI rebuild sidebar + shape grid
+    UI.rebuildForSubject(subjectId);
+    // Update topbar subject switcher button active states
+    const mathBtn = document.getElementById('subj-math');
+    const sciBtn  = document.getElementById('subj-sci');
+    if (mathBtn) mathBtn.classList.toggle('active', subjectId === 'mathematics');
+    if (sciBtn)  sciBtn.classList.toggle('active', subjectId === 'science');
+    // Reset chapter to first chapter of new subject
+    if (typeof CurriculumStore !== 'undefined') {
+      const chapters = CurriculumStore.getChapters();
+      if (chapters && chapters.length) {
+        activeChapter = chapters[0].id;
+        if (typeof UI !== 'undefined') {
+          if (UI.renderTopChapters) UI.renderTopChapters();
+          if (UI.updateSidebarCard) UI.updateSidebarCard();
+        }
+      }
+    }
+    // If chapter panel is open, re-render it immediately for new subject
+    const panel = document.getElementById('chapter-panel');
+    if (panel && panel.classList.contains('open')) {
+      UI.renderChapterPanel();
+    }
+    showToast(subjectId === 'science' ? '🔬 Switched to Science & Technology' : '📐 Switched to Mathematics');
+  }
+
+  function updateChapterLabel() {
+    let chName = null;
+    // Prefer CurriculumStore for the active subject's chapter name
+    if (typeof CurriculumStore !== 'undefined') {
+      const storeChapters = CurriculumStore.getChapters();
+      const ch = storeChapters.find(c => c.id === activeChapter || +c.id === +activeChapter);
+      if (ch) chName = `Ch ${ch.id} \u2014 ${ch.name}`;
+    }
+    // Fallback to legacy CHAPTERS array
+    if (!chName) {
+      const ch = CHAPTERS.find(c => c.id === activeChapter);
+      if (ch) chName = `Ch ${ch.id} \u2014 ${ch.name}`;
+    }
+    if (chName) {
+      const el = $('active-ch-label');
+      if (el) {
+        el.textContent = chName;
+        el.title = chName;
+      }
+      const rpBadge = document.getElementById('rp-active-ch-badge');
+      if (rpBadge) rpBadge.textContent = `Unit ${activeChapter}`;
+      const rpBtnLbl = document.getElementById('rp-ch-tools-btn-label');
+      if (rpBtnLbl) rpBtnLbl.textContent = `Ch ${activeChapter} Tools`;
+    }
+  }
+
+
+  // ─────────────────────────────────────────────
+  // RECORD
+  // ─────────────────────────────────────────────
+  function toggleRecord() {
+    recording = !recording;
+    const btn = $('btn-rec');
+    btn.classList.toggle('on', recording);
+    btn.innerHTML = recording
+      ? '<span class="rec-dot"></span> Stop'
+      : '<span class="rec-dot"></span> Record';
+  }
+
+  // ─────────────────────────────────────────────
+  // EXPORT ALL PAGES AS PDF
+  // ─────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // CLIENT-SIDE MULTI-PAGE PDF GENERATOR
+  // ─────────────────────────────────────────────
+    function ensureJpegDataUrl(dataUrl, fallbackW, fallbackH) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const actualWidth = img.naturalWidth || fallbackW || 1920;
+        const actualHeight = img.naturalHeight || fallbackH || 1080;
+        
+        if (dataUrl && typeof dataUrl === 'string' && dataUrl.startsWith('data:image/jpeg')) {
+          resolve({
+            dataUrl,
+            pixelWidth: actualWidth,
+            pixelHeight: actualHeight
+          });
+          return;
+        }
+        
+        const c = document.createElement('canvas');
+        c.width = actualWidth;
+        c.height = actualHeight;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        resolve({
+          dataUrl: c.toDataURL('image/jpeg', 0.95),
+          pixelWidth: c.width,
+          pixelHeight: c.height
+        });
+      };
+      img.onerror = () => {
+        resolve({
+          dataUrl,
+          pixelWidth: fallbackW || 1920,
+          pixelHeight: fallbackH || 1080
+        });
+      };
+      img.src = (typeof dataUrl === 'object' && dataUrl?.dataUrl) ? dataUrl.dataUrl : dataUrl;
+    });
+  }
+
+  function buildClientPdfBlob(snapshots) {
+    const chunks = [];
+    const offsets = [];
+    let pos = 0;
+    let objCount = 0;
+
+    function stringToLatin1Bytes(str) {
+      const len = str.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = str.charCodeAt(i) & 0xff;
+      }
+      return bytes;
+    }
+
+    function base64ToUint8Array(base64) {
+      const binaryString = window.atob(base64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function pushString(str) {
+      const bytes = stringToLatin1Bytes(str);
+      chunks.push(bytes);
+      pos += bytes.length;
+    }
+
+    function pushBytes(bytes) {
+      chunks.push(bytes);
+      pos += bytes.length;
+    }
+
+    function registerObj() {
+      objCount++;
+      offsets[objCount] = pos;
+      pushString(`${objCount} 0 obj\n`);
+      return objCount;
+    }
+
+    function endObj() {
+      pushString('\nendobj\n');
+    }
+
+    // 1. PDF Header (Standard %PDF-1.4 binary marker)
+    pushString('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n');
+
+    const numPages = snapshots.length;
+    const pageObjNums = [];
+    for (let i = 0; i < numPages; i++) {
+      pageObjNums.push(3 + 3 * i + 2);
+    }
+
+    // Obj 1: Catalog
+    offsets[1] = pos;
+    pushString(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`);
+
+    // Obj 2: Pages
+    offsets[2] = pos;
+    const kidsStr = pageObjNums.map(n => `${n} 0 R`).join(' ');
+    pushString(`2 0 obj\n<< /Type /Pages /Kids [${kidsStr}] /Count ${numPages} >>\nendobj\n`);
+
+    // Output each page (Image XObject -> Content Stream -> Page Object)
+    objCount = 2;
+    for (let i = 0; i < numPages; i++) {
+      const snap = snapshots[i];
+      const rawDataUrl = (typeof snap.dataUrl === 'string') ? snap.dataUrl : (snap.dataUrl?.dataUrl || '');
+      const b64 = rawDataUrl.replace(/^data:image\/[a-z]+;base64,/, '');
+      const imgBytes = base64ToUint8Array(b64);
+
+      // Exact pixel dimensions of the encoded JPEG stream
+      const actualPixelW = snap.pixelWidth || snap.w || 1920;
+      const actualPixelH = snap.pixelHeight || snap.h || 1080;
+
+      // Full-bleed logical page dimensions in PDF points (72 DPI)
+      const logicalW = snap.w || snap.pixelWidth || 1920;
+      const logicalH = snap.h || snap.pixelHeight || 1080;
+      const ptW = Math.round(logicalW * 72 / 96);
+      const ptH = Math.round(logicalH * 72 / 96);
+
+      // Image XObject: /Width and /Height MUST match the exact JPEG pixel dimensions!
+      const imgObj = registerObj();
+      pushString(`<< /Type /XObject /Subtype /Image /Width ${actualPixelW} /Height ${actualPixelH} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imgBytes.length} >>\nstream\n`);
+      pushBytes(imgBytes);
+      pushString('\nendstream');
+      endObj();
+
+      // Content stream: paints the full image at full 100% MediaBox page size
+      const cs = `q ${ptW} 0 0 ${ptH} 0 0 cm /Im1 Do Q`;
+      const csObj = registerObj();
+      pushString(`<< /Length ${cs.length} >>\nstream\n${cs}\nendstream`);
+      endObj();
+
+      // Page Object: MediaBox defines 100% of the page size (no 33% shrinkage, no top cropping)
+      const pageObj = registerObj();
+      pushString(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${ptW} ${ptH}] /Contents ${csObj} 0 R /Resources << /XObject << /Im1 ${imgObj} 0 R >> >> >>`);
+      endObj();
+    }
+
+    // XRef Table
+    const xrefPos = pos;
+    pushString(`xref\n0 ${objCount + 1}\n`);
+    pushString('0000000000 65535 f \n');
+    for (let i = 1; i <= objCount; i++) {
+      const off = String(offsets[i]).padStart(10, '0');
+      pushString(`${off} 00000 n \n`);
+    }
+
+    // Trailer
+    pushString(`trailer\n<< /Size ${objCount + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`);
+
+    return new Blob(chunks, { type: 'application/pdf' });
+  }
+
+  // ─────────────────────────────────────────────
+  // EXPORT ALL PAGES AS PDF
+  // ─────────────────────────────────────────────
+  async function exportPDF() {
+    showToast('Preparing pages for PDF…');
+    saveCurrent();
+
+    const savedPage  = currentPage;
+    const snapshots  = [];
+
+    for (let i = 0; i < pages.length; i++) {
+      showToast(`Rendering page ${i + 1} of ${pages.length}…`);
+      if (pages[i].boardColorId && typeof Canvas !== 'undefined' && Canvas.setBoardColor) {
+        Canvas.setBoardColor(pages[i].boardColorId);
+      }
+      Canvas.loadPageState(
+        pages[i].shapes,
+        pages[i].drawDataUrl || null,
+        pages[i].bgImage || null,
+        pages[i].strokes || [],
+        pages[i].history || [],
+        pages[i].redoStack || []
+      );
+      // Wait for canvas to fully paint
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await new Promise(r => setTimeout(r, 120));
+      // Use JPEG (smaller, reliable, 100% native in PDF)
+      const dataUrl = Canvas.snapshotJpeg();
+      // Use logical board bounds so Full Screen / zoom content is never cropped
+      const bounds = (Canvas.getExportBounds) ? Canvas.getExportBounds() : Canvas.getCanvasSize();
+      const pageW = bounds.w || bounds.W || 1920;
+      const pageH = bounds.h || bounds.H || 1080;
+      snapshots.push({ dataUrl, w: pageW, h: pageH, label: pages[i].label });
+    }
+
+    // Restore original page
+    if (pages[savedPage].boardColorId && typeof Canvas !== 'undefined' && Canvas.setBoardColor) {
+      Canvas.setBoardColor(pages[savedPage].boardColorId);
+    }
+    Canvas.loadPageState(
+      pages[savedPage].shapes,
+      pages[savedPage].drawDataUrl || null,
+      pages[savedPage].bgImage || null,
+      pages[savedPage].strokes || [],
+      pages[savedPage].history || [],
+      pages[savedPage].redoStack || []
+    );
+    currentPage = savedPage;
+    renderPageTabs();
+
+    if (window.electronAPI && typeof window.electronAPI.savePdf === 'function') {
+      showToast(`Building PDF…`);
+      const r = await window.electronAPI.savePdf(snapshots, 'PiyushDhara MathBoard');
+      if (r && r.success) {
+        showToast(`✓ PDF saved — ${r.pageCount} page(s)`);
+      } else {
+        showToast('PDF export cancelled');
+      }
+    } else {
+      showToast(`Converting ${snapshots.length} page(s) into PDF…`);
+      try {
+        for (let i = 0; i < snapshots.length; i++) {
+          const processed = await ensureJpegDataUrl(snapshots[i].dataUrl, snapshots[i].w, snapshots[i].h);
+          snapshots[i].dataUrl = processed.dataUrl;
+          snapshots[i].pixelWidth = processed.pixelWidth;
+          snapshots[i].pixelHeight = processed.pixelHeight;
+        }
+        const pdfBlob = buildClientPdfBlob(snapshots);
+        pendingPdfBlob = pdfBlob;
+        const now = new Date();
+        const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+        pendingPdfFilename = `PiyushDhara-Board-${stamp}.pdf`;
+
+        // Display download modal for a trusted 1-click download with real .pdf filename
+        openPdfModal(snapshots.length, pendingPdfFilename, pdfBlob.size);
+        showToast(`✓ PDF Ready (${snapshots.length} pages) — Click Download PDF`);
+      } catch (err) {
+        console.error('PDF generation error:', err);
+        showToast('❌ PDF export error: ' + err.message);
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // SNAPSHOT
+  // ─────────────────────────────────────────────
+  async function takeSnapshot() {
+    const dataUrl = Canvas.snapshot();
+    if (window.electronAPI) {
+      const r = await window.electronAPI.saveSnapshot(dataUrl);
+      if (r.success) showToast('Saved: ' + r.filePath);
+      return;
+    }
+
+    const filename = `MathBoard-Page${currentPage + 1}-${Date.now()}.png`;
+    try {
+      const res = await fetch(dataUrl);
+      const blob = await res.blob();
+      if (typeof window.showSaveFilePicker === 'function') {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{
+              description: 'PNG Image (*.png)',
+              accept: { 'image/png': ['.png'] }
+            }]
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          showToast(`✓ Saved: ${handle.name || filename}`);
+          return;
+        } catch (err) {
+          if (err && err.name === 'AbortError') return;
+        }
+      }
+      const a = document.createElement('a');
+      a.download = filename;
+      const blobUrl = URL.createObjectURL(blob);
+      a.href = blobUrl;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 10000);
+      showToast(`✓ Snapshot saved as ${filename}`);
+    } catch (e) {
+      const a = document.createElement('a');
+      a.download = filename;
+      a.href = dataUrl;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { if (a.parentNode) a.parentNode.removeChild(a); }, 10000);
+      showToast(`✓ Snapshot saved`);
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // SAVE / LOAD / CLEAR
+  // ─────────────────────────────────────────────
+
+  function restoreBoardState(data, fileName) {
+    if (!data) return;
+    pages = (data.pages || [{ id:1, label:'Page 1', shapes:[], drawData:null, drawDataUrl:null }]).map(pg => ({
+      ...pg,
+      drawData: null,
+      history: [],
+      redoStack: []
+    }));
+    currentPage = data.currentPage || 0;
+    if (currentPage >= pages.length) currentPage = 0;
+    loadCurrent();
+    if (data.chapter) selectChapter(data.chapter);
+    const savedSubject = data.subject || 'mathematics';
+    if (savedSubject !== activeSubject) {
+      switchSubject(savedSubject);
+    }
+    if (fileName) {
+      lastSaveName = fileName;
+      pages[currentPage].label = fileName.replace(/\.(mbp|json)$/i, '');
+    }
+    renderPageTabs();
+
+    // Restore workspace partitioning state if saved
+    if (typeof WorkspaceSplit !== 'undefined') {
+      if (data.splitMode && data.splitMode !== 'normal') {
+        WorkspaceSplit.restore(data.splitMode, data.splitRatio, data.partitionsState);
+      } else {
+        WorkspaceSplit.setMode('normal');
+      }
+    }
+
+    showToast(`✓ Loaded "${fileName || 'Board Session'}"`);
+  }
+
+  // Save board — clean state (strip redundant canvas history buffers to keep file light)
+  async function saveBoard({ forceDialog = false } = {}) {
+    saveCurrent();
+    const cleanPages = pages.map(pg => ({
+      id: pg.id,
+      label: pg.label,
+      shapes: pg.shapes ? JSON.parse(JSON.stringify(pg.shapes)) : [],
+      strokes: pg.strokes ? JSON.parse(JSON.stringify(pg.strokes)) : [],
+      drawDataUrl: pg.drawDataUrl || null,
+      bgImage: pg.bgImage || null,
+      boardColorId: pg.boardColorId || null
+      // Redundant undo/redo history snapshots omitted: reduces file size from 130MB to <200KB!
+    }));
+
+    const state = {
+      pages: cleanPages,
+      currentPage,
+      chapter: activeChapter,
+      subject: activeSubject,
+      savedAt: new Date().toISOString(),
+      splitMode: (typeof WorkspaceSplit !== 'undefined') ? WorkspaceSplit.getMode() : 'normal',
+      splitRatio: (typeof WorkspaceSplit !== 'undefined') ? WorkspaceSplit.getSplitRatio() : 50,
+      partitionsState: (typeof WorkspaceSplit !== 'undefined') ? WorkspaceSplit.serialize() : null
+    };
+
+    if (window.electronAPI) {
+      const savePath = (!forceDialog && lastSavePath) ? lastSavePath : null;
+      const defaultName = lastSaveName || pages[currentPage].label || 'MathBoard';
+
+      const r = await window.electronAPI.saveBoard(state, defaultName, savePath);
+      if (!r.success) { showToast('Save cancelled'); return; }
+
+      lastSavePath   = r.filePath;
+      lastSaveFolder = r.filePath.substring(0, r.filePath.lastIndexOf('\\') || r.filePath.lastIndexOf('/'));
+      lastSaveName   = r.fileName;
+
+      pages[currentPage].label = r.fileName;
+      renderPageTabs();
+
+      showToastWithAction(
+        `✓ Saved as "${r.fileName}"`,
+        'Open Folder',
+        () => window.electronAPI.openFolder(lastSaveFolder)
+      );
+
+    } else {
+      // Browser fallback — lightweight session file (.mbp)
+      const now = new Date();
+      const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+      const defaultName = lastSaveName || `MathBoard-${stamp}.mbp`;
+      const jsonStr = JSON.stringify(state);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+
+      if (typeof window.showSaveFilePicker === 'function') {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [{
+              description: 'PiyushDhara Board Session (*.mbp, *.json)',
+              accept: { 'application/json': ['.mbp', '.json'] }
+            }]
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          lastSaveName = handle.name || defaultName;
+          pages[currentPage].label = lastSaveName.replace(/\.(mbp|json)$/i, '');
+          renderPageTabs();
+          showToast(`✓ Saved: "${handle.name || defaultName}"`);
+          return;
+        } catch (err) {
+          if (err && err.name === 'AbortError') return;
+          console.warn('showSaveFilePicker failed, falling back to download:', err);
+        }
+      }
+
+      // Direct anchor download
+      const a = document.createElement('a');
+      a.download = defaultName;
+      const blobUrl = URL.createObjectURL(blob);
+      a.href = blobUrl;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 10000);
+      showToast(`✓ Saved as ${defaultName}`);
+    }
+  }
+
+  // Save As — always shows dialog
+  async function saveBoardAs() {
+    await saveBoard({ forceDialog: true });
+  }
+
+  // Load board — works seamlessly in both Electron and Browser
+  async function loadBoard() {
+    if (window.electronAPI) {
+      const r = await window.electronAPI.loadBoard(lastSaveFolder || null);
+      if (!r.success || !r.data) { showToast('Load cancelled'); return; }
+      lastSavePath   = r.filePath;
+      lastSaveFolder = r.folder;
+      restoreBoardState(r.data, r.fileName);
+      return;
+    }
+
+    // Browser mode
+    if (typeof window.showOpenFilePicker === 'function') {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{
+            description: 'PiyushDhara Board Session (*.mbp, *.json)',
+            accept: { 'application/json': ['.mbp', '.json'] }
+          }]
+        });
+        const file = await handle.getFile();
+        const text = await file.text();
+        const data = JSON.parse(text);
+        restoreBoardState(data, file.name);
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        console.warn('showOpenFilePicker error, using input fallback:', err);
+      }
+    }
+
+    let input = document.getElementById('board-session-file-input');
+    if (!input) {
+      input = document.createElement('input');
+      input.type = 'file';
+      input.id = 'board-session-file-input';
+      input.accept = '.mbp,.json,application/json';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const data = JSON.parse(text);
+          restoreBoardState(data, file.name);
+        } catch (err) {
+          showToast('❌ Invalid session file');
+        }
+        input.value = '';
+      };
+    }
+    input.click();
+  }
+
+
+
+  // ─────────────────────────────────────────────
+  // TOAST (plain) + TOAST WITH ACTION BUTTON — SmartBoard enlarged
+  // ─────────────────────────────────────────────
+  function showToast(msg) {
+    const t = document.createElement('div');
+    t.style.cssText = `position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:rgba(7,16,31,.97);border:1.5px solid rgba(201,168,76,.6);color:#e8c96b;padding:12px 26px;border-radius:12px;font-size:15px;font-weight:600;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.65);transition:opacity .3s;font-family:'Segoe UI',sans-serif;pointer-events:none`;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.opacity='0'; setTimeout(() => t.remove(), 300); }, 2500);
+  }
+
+  function showToastWithAction(msg, btnLabel, onAction) {
+    const t = document.createElement('div');
+    t.style.cssText = `position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:rgba(7,16,31,.97);border:1.5px solid rgba(201,168,76,.6);color:#e8c96b;padding:12px 24px;border-radius:12px;font-size:15px;font-weight:600;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.65);display:flex;align-items:center;gap:14px;font-family:'Segoe UI',sans-serif`;
+    const span = document.createElement('span');
+    span.textContent = msg;
+    const btn = document.createElement('button');
+    btn.textContent = btnLabel;
+    btn.style.cssText = `background:rgba(201,168,76,.25);border:1px solid rgba(201,168,76,.7);color:#e8c96b;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13.5px;font-weight:600;font-family:'Segoe UI',sans-serif;min-height:36px;`;
+    btn.onclick = () => { onAction(); t.remove(); };
+    t.appendChild(span);
+    t.appendChild(btn);
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(() => t.remove(), 300); }, 4500);
+  }
+
+  // ─────────────────────────────────────────────
+  // SIMULATION & IMMERSIVE STATE
+  // ─────────────────────────────────────────────
+  function isSimulationActive() {
+    if (window.PhysicsLab && typeof PhysicsLab.isVisible === 'function' && PhysicsLab.isVisible()) return 'physics';
+    if (window.MathVisualizer && typeof MathVisualizer.isVisible === 'function' && MathVisualizer.isVisible()) return 'math';
+    if (window.GraphEngine && typeof GraphEngine.isVisible === 'function' && GraphEngine.isVisible()) return 'graph';
+    return false;
+  }
+
+  function undo() {
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+      WorkspaceSplit.undoActive();
+      return;
+    }
+    const sim = isSimulationActive();
+    if (sim === 'physics' && window.PhysicsLab && typeof PhysicsLab.undo === 'function') {
+      PhysicsLab.undo();
+      return;
+    }
+    if (sim === 'math' && window.MathVisualizer && typeof MathVisualizer.undo === 'function') {
+      MathVisualizer.undo();
+      return;
+    }
+    if (sim === 'graph' && window.GraphEngine && typeof GraphEngine.undo === 'function') {
+      GraphEngine.undo();
+      return;
+    }
+    if (typeof Canvas !== 'undefined' && Canvas.undo) {
+      Canvas.undo();
+    }
+  }
+
+  function redo() {
+    if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+      WorkspaceSplit.redoActive();
+      return;
+    }
+    const sim = isSimulationActive();
+    if (sim === 'physics' && window.PhysicsLab && typeof PhysicsLab.redo === 'function') {
+      PhysicsLab.redo();
+      return;
+    }
+    if (sim === 'math' && window.MathVisualizer && typeof MathVisualizer.redo === 'function') {
+      MathVisualizer.redo();
+      return;
+    }
+    if (sim === 'graph' && window.GraphEngine && typeof GraphEngine.redo === 'function') {
+      GraphEngine.redo();
+      return;
+    }
+    if (typeof Canvas !== 'undefined' && Canvas.redo) {
+      Canvas.redo();
+    }
+  }
+
+  function toggleFullscreen() {
+    const isNowFullscreen = document.body.classList.toggle('board-fullscreen');
+    if (isNowFullscreen) {
+      if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      }
+    } else {
+      if (document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+    setTimeout(() => {
+      if (typeof Canvas !== 'undefined' && Canvas.resize) {
+        Canvas.resize();
+      }
+      updatePageControls();
+    }, 80);
+  }
+
+  function setSimulationActive(active) {
+    if (active) {
+      document.body.classList.add('sim-active');
+    } else {
+      document.body.classList.remove('sim-active');
+    }
+    setTimeout(() => {
+      if (typeof Canvas !== 'undefined' && Canvas.resize) {
+        Canvas.resize();
+      }
+    }, 60);
+  }
+
+  // ─────────────────────────────────────────────
+  // KEYBOARD
+  // ─────────────────────────────────────────────
+  function onKey(e) {
+    const tag = document.activeElement?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+    // Alt+A: Activate Area Solver (auto-switches to pen, then calculates on shape completion)
+    if (e.altKey && (e.key === 'a' || e.key === 'A')) {
+      e.preventDefault();
+      if (typeof AreaSolver !== 'undefined') AreaSolver.activate();
+      return;
+    }
+
+    // Digital Compass keys (Esc cancel/close, Enter draw, arrows move, [ ] radius) while it is active
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && typeof CompassTool !== 'undefined' && CompassTool.handleKey(e)) return;
+
+    if (e.ctrlKey || e.metaKey) {
+      const key = e.key.toLowerCase();
+      if (e.shiftKey && key === 'n') {
+        e.preventDefault();
+        addPage();
+        return;
+      }
+      if (key === 'c') {
+        if (typeof BoardClipboard !== 'undefined' && BoardClipboard.hasSelection()) {
+          e.preventDefault();
+          BoardClipboard.copy();
+          return;
+        }
+      }
+      if (key === 'v') {
+        if (typeof BoardClipboard !== 'undefined' && BoardClipboard.hasClipboardData()) {
+          e.preventDefault();
+          BoardClipboard.paste();
+          return;
+        }
+      }
+      if (key === 'x') {
+        if (typeof BoardClipboard !== 'undefined' && BoardClipboard.hasSelection()) {
+          e.preventDefault();
+          BoardClipboard.cut();
+          return;
+        }
+      }
+      if (key === 'd') {
+        if (typeof BoardClipboard !== 'undefined' && BoardClipboard.hasSelection()) {
+          e.preventDefault();
+          BoardClipboard.duplicate();
+          return;
+        }
+      }
+      if (e.key === 'z') { e.preventDefault(); undo(); }
+      if (e.key === 'y') { e.preventDefault(); redo(); }
+      if (e.key === 's') { e.preventDefault(); saveBoard(); }
+      if (e.key === '[' || e.key === '-') { e.preventDefault(); Canvas.adjustFontSize(-2); }
+      if (e.key === ']' || e.key === '=' || e.key === '+') { e.preventDefault(); Canvas.adjustFontSize(2); }
+      return;
+    }
+    if (e.key === 'PageUp') {
+      e.preventDefault();
+      prevPage();
+      return;
+    }
+    if (e.key === 'PageDown') {
+      e.preventDefault();
+      nextPage();
+      return;
+    }
+    if (e.key === '[' || e.key === '-') { Canvas.adjustFontSize(-2); return; }
+    if (e.key === ']' || e.key === '=' || e.key === '+') { Canvas.adjustFontSize(2); return; }
+    if (e.key === 'ArrowUp')    { e.preventDefault(); Canvas.nudgeSelected(0, e.shiftKey ? -10 : -2); return; }
+    if (e.key === 'ArrowDown')  { e.preventDefault(); Canvas.nudgeSelected(0, e.shiftKey ? 10 : 2); return; }
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); Canvas.nudgeSelected(e.shiftKey ? -10 : -2, 0); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); Canvas.nudgeSelected(e.shiftKey ? 10 : 2, 0); return; }
+    const map = { v:'select', p:'pen', h:'highlighter', t:'text', l:'line', d:'dashed', a:'arrow', e:'eraser', s:'smart-draw', r:'compass' };
+    const k = (e.key || '').toLowerCase();
+    if (map[k]) setTool(map[k]);
+    if (e.key === 'i' || e.key === 'I') { if (typeof ImageTool !== 'undefined') ImageTool.openPicker(); }
+    if (e.key === 'Escape') {
+      const clearModal = $('fs-clear-modal');
+      if (clearModal && !clearModal.classList.contains('hidden')) {
+        closeClearModal();
+        return;
+      }
+      const pdfModal = $('pdf-ready-modal');
+      if (pdfModal && !pdfModal.classList.contains('hidden')) {
+        closePdfModal();
+        return;
+      }
+      if (typeof AreaSolver !== 'undefined') {
+        AreaSolver.close();
+      }
+      if (typeof BoardClipboard !== 'undefined' && BoardClipboard.clearSelection) {
+        BoardClipboard.clearSelection();
+      }
+      if (typeof UI !== 'undefined' && UI.isChapterPanelOpen && UI.isChapterPanelOpen()) {
+        UI.closeChapterPanel();
+        return;
+      }
+      setTool('select');
+      Canvas.deselectAll();
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (typeof BoardClipboard !== 'undefined' && BoardClipboard.hasSelection()) {
+        e.preventDefault();
+        BoardClipboard.deleteSelected();
+        return;
+      }
+      Canvas.deleteShape();
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // BOARD STATE — for Presentation Library
+  // ─────────────────────────────────────────────
+  function getBoardState() {
+    // Capture current page before serializing
+    saveCurrent();
+    return {
+      pages: pages.map(pg => ({
+        id:          pg.id,
+        label:       pg.label,
+        shapes:      pg.shapes      ? JSON.parse(JSON.stringify(pg.shapes)) : [],
+        drawDataUrl: pg.drawDataUrl || null,  // base64 PNG — fully serializable
+      })),
+      currentPage,
+      chapter: activeChapter,
+    };
+  }
+
+  function loadBoardState(data) {
+    if (!data) return;
+    pages = (data.pages || [{ id:1, label:'Page 1', shapes:[], drawData:null, drawDataUrl:null }]).map(pg => ({
+      ...pg,
+      drawData: null,            // will be restored from drawDataUrl by loadCurrent
+    }));
+    currentPage = data.currentPage || 0;
+    if (currentPage >= pages.length) currentPage = 0;
+    loadCurrent();
+    if (data.chapter) selectChapter(data.chapter);
+    renderPageTabs();
+  }
+
+  // ─────────────────────────────────────────────
+  // ENTIRE BOARD BRIGHTNESS CONTROL
+  // ─────────────────────────────────────────────
+  let boardBrightness = 100;
+
+  function initBrightness() {
+    try {
+      const saved = localStorage.getItem('mbp_board_brightness');
+      if (saved) {
+        setBoardBrightness(parseInt(saved), false);
+      }
+    } catch(e) {}
+
+    const bCtrl = document.getElementById('board-brightness-control');
+    if (bCtrl) {
+      bCtrl.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        adjustBoardBrightness(e.deltaY < 0 ? 5 : -5);
+      }, { passive: false });
+    }
+  }
+
+  function adjustBoardBrightness(delta) {
+    setBoardBrightness(boardBrightness + delta);
+  }
+
+  function setBoardBrightness(val, save = true) {
+    boardBrightness = Math.max(30, Math.min(100, Math.round((parseInt(val) || 100) / 5) * 5));
+    if (save) {
+      try { localStorage.setItem('mbp_board_brightness', boardBrightness); } catch(e) {}
+    }
+
+    const overlay = document.getElementById('board-brightness-overlay');
+    if (overlay) {
+      const opacity = ((100 - boardBrightness) / 100) * 0.78;
+      overlay.style.opacity = opacity.toFixed(2);
+    }
+
+    const lbl = document.getElementById('brightness-val-label');
+    if (lbl) lbl.textContent = `${boardBrightness}%`;
+
+    const pctText = document.getElementById('bdm-pct-text');
+    if (pctText) pctText.textContent = `${boardBrightness}%`;
+
+    const slider = document.getElementById('board-brightness-slider');
+    if (slider) slider.value = boardBrightness;
+
+    document.querySelectorAll('.bdm-preset-btn').forEach(btn => {
+      btn.classList.toggle('active', parseInt(btn.dataset.b) === boardBrightness);
+    });
+  }
+
+  function toggleBrightnessMenu(e) {
+    if (e) e.stopPropagation();
+    const dd = document.getElementById('brightness-dropdown');
+    if (dd) {
+      dd.classList.toggle('hidden');
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // PUBLIC
+  // ─────────────────────────────────────────────
+  return {
+    init,
+    undo,
+    redo,
+    toggleFullscreen,
+    setSimulationActive,
+    isSimulationActive,
+    setTool, setColor,
+    selectChapter, switchSubject,
+    toggleSidebar, toggleRPanel,
+    addPage, insertPageMiddle, deleteCurrentPage, switchPage, deletePage,
+    prevPage, nextPage, updatePageControls,
+    confirmClearCurrentPage, closeClearModal, executeClearCurrentPage, executeDeleteCurrentPage,
+    openPdfModal, closePdfModal, downloadGeneratedPdf,
+    getPages: () => pages, getCurrentPage: () => currentPage,
+    getCurrentPageIndex: () => currentPage, getPageCount: () => pages.length,
+    toggleRecord, takeSnapshot, exportPDF,
+    saveBoard, saveBoardAs, loadBoard, clearBoard,
+    saveCurrent, getBoardState, loadBoardState,
+    showToast, showToastWithAction,
+    get currentTool()  { return currentTool; },
+    get currentColor() { return currentColor; },
+    get penSize()      { return penSize; },
+    set penSize(v)     {
+      penSize = v;
+      if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+        WorkspaceSplit.setActivePartitionSize(v);
+      }
+    },
+    get eraserSize()   { return eraserSize; },
+    set eraserSize(v)  {
+      eraserSize = v;
+      if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+        WorkspaceSplit.setActivePartitionEraserSize(v);
+      }
+    },
+    setPenSize: (v) => {
+      penSize = v;
+      if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+        WorkspaceSplit.setActivePartitionSize(v);
+      }
+    },
+    setEraserSize: (v) => {
+      eraserSize = v;
+      if (typeof WorkspaceSplit !== 'undefined' && WorkspaceSplit.getMode() !== 'normal') {
+        WorkspaceSplit.setActivePartitionEraserSize(v);
+      }
+    },
+    get activeChapter(){ return activeChapter; },
+    get activeSubject(){ return activeSubject; },
+    setBoardBrightness,
+    adjustBoardBrightness,
+    toggleBrightnessMenu,
+    getBoardBrightness: () => boardBrightness,
+    saveActiveSession,
+    restoreActiveSession,
+    scheduleAutoSave,
+    clearActiveSessionStorage,
+    // board history (last 2 days)
+    flushSession,
+    listHistory,
+    openHistoryEntry,
+    deleteHistoryEntry: deleteEntry,
+    clearHistory,
+    startNewBoard,
+    get historyDays() { return HISTORY_TTL_MS / 86400000; }
+  };
+
+})();
+
+window.App = App;
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', App.init);
+} else {
+  App.init();
+}
